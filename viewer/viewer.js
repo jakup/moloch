@@ -76,6 +76,7 @@ var internals = {
   rightClicks: {},
   pluginEmitter: new EventEmitter(),
   writers: {},
+  oldDBFields: {},
 
   cronTimeout: +Config.get("dbFlushTimeout", 5) + // How long capture holds items
                60 +                               // How long before ES reindexs
@@ -169,7 +170,7 @@ app.use(compression());
 app.use(methodOverride());
 
 
-app.use('/font-awesome', express.static(__dirname + '/node_modules/font-awesome', { maxAge: 600 * 1000}));
+app.use('/font-awesome', express.static(__dirname + '/../node_modules/font-awesome', { maxAge: 600 * 1000}));
 app.use('/bootstrap', express.static(__dirname + '/node_modules/bootstrap', { maxAge: 600 * 1000}));
 
 app.use('/cyberchef.htm', function(req, res, next) {
@@ -314,6 +315,7 @@ function loadFields() {
 
     // Everything will use dbField2 as dbField
     for (let i = 0, ilen = data.length; i < ilen; i++) {
+      internals.oldDBFields[data[i]._source.dbField] = data[i]._source;
       data[i]._source.dbField = data[i]._source.dbField2;
       if (data[i]._source.portField2) {
         data[i]._source.portField = data[i]._source.portField2;
@@ -1338,9 +1340,25 @@ app.post('/user/password/change', [checkCookieToken, logAction(), postSettingUse
   });
 });
 
+function oldDB2newDB(x) {
+  if (!internals.oldDBFields[x]) {return x;}
+  return internals.oldDBFields[x].dbField2;
+}
+
 // gets custom column configurations for a user
 app.get('/user/columns', getSettingUser, function(req, res) {
   if (!req.settingUser) {return res.send([]);}
+
+  // Fix for new names
+  if (req.settingUser.columnConfigs) {
+    for (var key in req.settingUser.columnConfigs) {
+      let item = req.settingUser.columnConfigs[key];
+      item.columns = item.columns.map(oldDB2newDB);
+      if (item.order && item.order.length > 0) {
+        item.order[0][0] = oldDB2newDB(item.order[0][0]);
+      }
+    }
+  }
 
   return res.send(req.settingUser.columnConfigs || []);
 });
@@ -2315,6 +2333,22 @@ app.get('/esindices/list', function(req, res) {
   });
 });
 
+app.delete('/esindices/:index', logAction(), checkCookieToken, function(req, res) {
+  if (!req.user.createEnabled) { return res.molochError(403, 'Need admin privileges'); }
+
+  if (!req.params.index) {
+    return res.molochError(403, 'Missing index to delete');
+  }
+
+  Db.deleteIndex([req.params.index], {}, (err, result) => {
+    if (err) {
+      res.status(404);
+      return res.send(JSON.stringify({ success:false, text:'Error deleting index' }));
+    }
+    return res.send(JSON.stringify({ success: true, text: result }));
+  });
+});
+
 app.get('/estask/list', function(req, res) {
   Db.tasks(function(err, tasks) {
     tasks = tasks.tasks;
@@ -2337,18 +2371,22 @@ app.get('/estask/list', function(req, res) {
         task.childrenCount = 0;
       }
       delete task.children;
+
+      if (req.query.cancellable && req.query.cancellable === 'true') {
+        if (!task.cancellable) { continue; }
+      }
+
       rtasks.push(task);
     }
 
     tasks = rtasks;
 
-    // Implement sorting
     var sortField = req.query.sortField || "action";
     if (sortField === "action") {
       if (req.query.desc === "true") {
-        tasks = tasks.sort(function(a,b){ return b.index.localeCompare(a.index); });
+        tasks = tasks.sort(function(a,b){ return b.action.localeCompare(a.index); });
       } else {
-        tasks = tasks.sort(function(a,b){ return a.index.localeCompare(b.index); });
+        tasks = tasks.sort(function(a,b){ return a.action.localeCompare(b.index); });
       }
     } else {
       if (req.query.desc === "true") {
@@ -2357,6 +2395,7 @@ app.get('/estask/list', function(req, res) {
         tasks = tasks.sort(function(a,b){ return a[sortField] - b[sortField]; });
       }
     }
+
     res.send(tasks);
   });
 });
@@ -2388,11 +2427,18 @@ app.get('/esshard/list', function(req, res) {
       nodeExcludes = settings.persistent['cluster.routing.allocation.exclude._name'].split(',');
     }
 
+    var regex;
+    if (req.query.filter !== undefined) {
+      regex = new RegExp(req.query.filter);
+    }
+
     let result = {};
     let nodes = {};
 
     for (var shard of shards) {
       if (shard.node === null || shard.node === "null") { shard.node = "Unassigned"; }
+
+      if (regex && !shard.index.match(regex) && !shard.node.match(regex)) { continue; }
 
       if (result[shard.index] === undefined) {
         result[shard.index] = {name: shard.index, nodes: {}};
@@ -2402,11 +2448,27 @@ app.get('/esshard/list', function(req, res) {
       }
       result[shard.index].nodes[shard.node].push(shard);
       nodes[shard.node] = {ip: shard.ip, ipExcluded: ipExcludes.includes(shard.ip), nodeExcluded: nodeExcludes.includes(shard.node)};
+
+      result[shard.index].nodes[shard.node]
+        .sort((a, b) => {
+          return a.shard - b.shard;
+        });
+
       delete shard.node;
       delete shard.index;
     }
 
-    let indices = Object.keys(result).map((k) => result[k]).sort(function(a,b){ return a.name.localeCompare(b.name); });
+    let indices = Object.keys(result).map((k) => result[k]);
+    if (req.query.desc === 'true') {
+      indices = indices.sort(function (a, b) {
+        return b.name.localeCompare(a.name);
+      });
+    } else {
+      indices = indices.sort(function (a, b) {
+        return a.name.localeCompare(b.name);
+      });
+    }
+
     res.send({nodes: nodes, indices: indices, nodeExcludes: nodeExcludes, ipExcludes: ipExcludes});
   });
 });
@@ -2420,10 +2482,10 @@ app.post('/esshard/exclude/:type/:value', logAction(), checkCookieToken, functio
 
     if (req.params.type === 'ip') {
       settingName = 'cluster.routing.allocation.exclude._ip';
-    } else if (req.params.type === "node") {
+    } else if (req.params.type === 'name') {
       settingName = 'cluster.routing.allocation.exclude._name';
     } else {
-      return res.molochError(403, "Unknown exclude type");
+      return res.molochError(403, 'Unknown exclude type');
     }
 
     if (settings.persistent[settingName]) {
@@ -2434,7 +2496,7 @@ app.post('/esshard/exclude/:type/:value', logAction(), checkCookieToken, functio
       exclude.push(req.params.value);
     }
     var query = {body: {persistent: {}}};
-    query.body.persistent[settingName] = exclude.join(",");
+    query.body.persistent[settingName] = exclude.join(',');
 
     Db.putClusterSettings(query, function(err, settings) {
       if (err) {console.log("putSettings", err);}
@@ -2452,10 +2514,10 @@ app.post('/esshard/include/:type/:value', logAction(), checkCookieToken, functio
 
     if (req.params.type === 'ip') {
       settingName = 'cluster.routing.allocation.exclude._ip';
-    } else if (req.params.type === "node") {
+    } else if (req.params.type === 'name') {
       settingName = 'cluster.routing.allocation.exclude._name';
     } else {
-      return res.molochError(403, "Unknown include type");
+      return res.molochError(403, 'Unknown include type');
     }
 
     if (settings.persistent[settingName]) {
@@ -2467,7 +2529,7 @@ app.post('/esshard/include/:type/:value', logAction(), checkCookieToken, functio
       exclude.splice(pos, 1);
     }
     var query = {body: {persistent: {}}};
-    query.body.persistent[settingName] = exclude.join(",");
+    query.body.persistent[settingName] = exclude.join(',');
 
     Db.putClusterSettings(query, function(err, settings) {
       if (err) {console.log("putSettings", err);}
@@ -2521,10 +2583,12 @@ app.get('/esstats.json', function(req, res) {
         write = Math.ceil((node.fs.io_stats.total.write_kilobytes - oldnode.fs.io_stats.total.write_kilobytes)/timediffsec*1024);
       }
 
+      var ip = (node.ip?node.ip.split(":")[0]:node.host);
+
       stats.push({
         name: node.name,
-        ip: node.host,
-        ipExcluded: ipExcludes.includes(node.host),
+        ip: ip,
+        ipExcluded: ipExcludes.includes(ip),
         nodeExcluded: nodeExcludes.includes(node.name),
         storeSize: node.indices.store.size_in_bytes,
         docs: node.indices.docs.count,
@@ -3121,7 +3185,7 @@ app.get('/spiview.json', logAction('spiview'), function(req, res) {
     return res.send({spi:{}, recordsTotal: 0, recordsFiltered: 0});
   }
 
-  var spiDataMaxIndices = +Config.get("spiDataMaxIndices", 1);
+  var spiDataMaxIndices = +Config.get("spiDataMaxIndices", 4);
 
   if (req.query.date === '-1' && spiDataMaxIndices !== -1) {
     return res.send({spi: {}, bsqErr: "'All' date range not allowed for spiview query"});
@@ -3305,6 +3369,16 @@ function buildConnections(req, res, cb) {
   var connects = {};
 
   function process(vsrc, vdst, f) {
+
+    // ES 6 is returning formatted timestamps instead of ms like pre 6 did
+    // https://github.com/elastic/elasticsearch/issues/27740
+    if (vsrc.length === 24 && vsrc[23] === 'Z' && vsrc.match(/^\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\d.\d\d\dZ$/)) {
+      vsrc = new Date(vsrc).getTime();
+    }
+    if (vdst.length === 24 && vdst[23] === 'Z' && vdst.match(/^\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\d.\d\d\dZ$/)) {
+      vdst = new Date(vdst).getTime();
+    }
+
     if (nodesHash[vsrc] === undefined) {
       nodesHash[vsrc] = {id: ""+vsrc, db: 0, by: 0, pa: 0, cnt: 0, sessions: 0};
     }
@@ -3559,7 +3633,7 @@ app.get('/unique.txt', logAction(), function(req, res) {
       return;
     }
 
-    var spiDataMaxIndices = +Config.get("spiDataMaxIndices", 3);
+    var spiDataMaxIndices = +Config.get("spiDataMaxIndices", 4);
     if (spiDataMaxIndices !== -1) {
       if (req.query.date === '-1' ||
           (req.query.date !== undefined && +req.query.date > spiDataMaxIndices)) {
@@ -3728,22 +3802,20 @@ function processSessionId(id, fullSession, headerCb, packetCb, endCb, maxPackets
     /* Go through the list of prefetch the id to file name if we are running in parallel to
      * reduce the number of elasticsearch queries and problems
      */
-    var outstanding = 0;
-    for (var i = 0, ilen = fields.packetPos.length; i < ilen; i++) {
-      if (fields.packetPos[i] < 0) {
-        outstanding++;
-        Db.fileIdToFile(fields.node, -1 * fields.packetPos[i], function (info) {
-          outstanding--;
-          if (i === ilen && outstanding === 0) {
-            i++; // So not called again below
-            readyToProcess();
-          }
-        });
+    let outstanding = 0, i, ilen;
+
+    function fileReadyCb (fileInfo) {
+      outstanding--;
+      if (i === ilen && outstanding === 0) {
+        readyToProcess();
       }
     }
 
-    if (i === ilen && outstanding === 0) {
-      readyToProcess();
+    for (i = 0, ilen = fields.packetPos.length; i < ilen; i++) {
+      if (fields.packetPos[i] < 0) {
+        outstanding++;
+        Db.fileIdToFile(fields.node, -1 * fields.packetPos[i], fileReadyCb);
+      }
     }
 
     function readyToProcess() {
@@ -4679,6 +4751,16 @@ app.get('/state/:name', function(req, res) {
   if (!req.user.tableStates || !req.user.tableStates[req.params.name]) {
     return res.send("{}");
   }
+
+  // Fix for new names
+  if (req.params.name === "sessionsNew" && req.user.tableStates && req.user.tableStates.sessionsNew) {
+    let item = req.user.tableStates.sessionsNew;
+    item.visibleHeaders = item.visibleHeaders.map(oldDB2newDB);
+    if (item.order && item.order.length > 0) {
+      item.order[0][0] = oldDB2newDB(item.order[0][0]);
+    }
+  }
+
   return res.send(req.user.tableStates[req.params.name]);
 });
 
@@ -5642,7 +5724,80 @@ app.get("/:nodeName/session/:id/cyberchef", checkWebEnabled, checkProxyRequest, 
   });
 });
 
+//////////////////////////////////////////////////////////////////////////////////
+// Vue app
+//////////////////////////////////////////////////////////////////////////////////
+const Vue = require('vue');
+const vueServerRenderer = require('vue-server-renderer');
 
+// Factory function to create fresh Vue apps
+function createApp () {
+  return new Vue({
+    template: `<div id="app"></div>`
+  });
+}
+
+// expose vue bundles (prod)
+app.use('/static', express.static(`${__dirname}/vueapp/dist/static`));
+// expose vue bundle (dev)
+app.use(['/app.js', '/vueapp/app.js'], express.static(`${__dirname}/vueapp/dist/app.js`));
+
+app.get('/stats', (req, res) => {
+  let cookieOptions = { path: app.locals.basePath };
+  if (Config.isHTTPS()) { cookieOptions.secure = true; }
+
+  // send cookie for basic, non admin functions
+  res.cookie(
+     'MOLOCH-COOKIE',
+     Config.obj2auth({date: Date.now(), pid: process.pid, userId: req.user.userId}),
+     cookieOptions
+  );
+
+  const renderer = vueServerRenderer.createRenderer({
+    template: fs.readFileSync('./vueapp/dist/index.html', 'utf-8')
+  });
+
+  let theme = req.user.settings.theme || 'default-theme';
+  if (theme.startsWith('custom1')) { theme  = 'custom-theme'; }
+
+  let titleConfig = Config.get('titleTemplate', '_cluster_ - _page_ _-view_ _-expression_')
+    .replace(/_cluster_/g, internals.clusterName)
+    .replace(/_userId_/g, req.user?req.user.userId:'-')
+    .replace(/_userName_/g, req.user?req.user.userName:'-');
+
+  const appContext = {
+    theme: theme,
+    titleConfig: titleConfig,
+    path: app.locals.basePath,
+    version: app.locals.molochversion,
+    devMode: Config.get('devMode', false),
+    demoMode: Config.get('demoMode', false),
+    themeUrl: theme === 'custom-theme' ? 'user.css' : ''
+  };
+
+  // Create a fresh Vue app instance
+  const vueApp = createApp();
+
+  // Render the Vue instance to HTML
+  renderer.renderToString(vueApp, appContext, (err, html) => {
+    if (err) {
+      console.error(err);
+      if (err.code === 404) {
+        res.status(404).end('Page not found');
+      } else {
+        res.status(500).end('Internal Server Error');
+      }
+      return;
+    }
+
+    res.send(html);
+  });
+});
+
+
+//////////////////////////////////////////////////////////////////////////////////
+// Angular app
+//////////////////////////////////////////////////////////////////////////////////
 app.use(express.static(__dirname + '/views'));
 app.use(express.static(__dirname + '/bundle'));
 app.use(function (req, res) {
