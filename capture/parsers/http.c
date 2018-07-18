@@ -19,6 +19,7 @@
 //#define HTTPDEBUG 1
 
 #define MAX_URL_LENGTH 4096
+#define MAX_COOKIE_LENGTH 4096
 
 typedef struct {
     MolochSession_t *session;
@@ -429,13 +430,20 @@ LOCAL int moloch_hp_cb_on_headers_complete (http_parser *parser)
             char *equal = strchr(start, '=');
             if (!equal)
                 break;
-            moloch_field_string_add(cookieKeyField, session, start, equal-start, TRUE);
+            int keyLen = equal - start;
+            if (keyLen > MAX_COOKIE_LENGTH)
+                keyLen = MAX_COOKIE_LENGTH;
+            moloch_field_string_add(cookieKeyField, session, start, keyLen, TRUE);
             start = strchr(equal+1, ';');
             if (config.parseCookieValue) {
                 equal++;
                 while (isspace(*equal)) equal++;
-                if (*equal && equal != start)
-                    moloch_field_string_add(cookieValueField, session, equal, start?start-equal:-1, TRUE);
+                if (*equal && equal != start) {
+                    int valLen = start ? start - equal : strlen(equal);
+                    if (valLen > MAX_COOKIE_LENGTH)
+                        valLen = MAX_COOKIE_LENGTH;
+                    moloch_field_string_add(cookieValueField, session, equal, valLen, TRUE);
+                }
             }
 
             if(!start)
